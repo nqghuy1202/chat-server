@@ -1,0 +1,163 @@
+# Notification System
+
+## CQN + Long-poll
+
+**`chat-server/cqn.js`** — standalone module, `require('./cqn')` in `server.js`. Exports `startCQN(emitFn)`.
+
+**Internal state:**
+- `rowidCache` Map (rowid → aus_id) — loaded from DB on startup; INSERT adds, DELETE reads-and-removes
+- `RETRY_INTERVAL_MS = 15s` auto-reconnect on CQN subscription failure
+- Calls `emitFn(ausId)` which maps to `notifyUser` in `events.js`
+
+**CQN rules:**
+- Uses `ipAddress/port` callback — `clientInitiated: true` requires Oracle 19.4+, not available here
+- CQN connection has `events: true`; DB queries use a **separate pool connection** — never query on the CQN connection
+- Message structure: `message.queries[0].tables[0].rows[k].rowid` (SUBSCR_QOS_QUERY layout)
+- When Oracle delivers >80 ROWIDs in one transaction it sends none — `handleFullScan()` is fallback
+- `table.operation & oracledb.CQN_OPCODE_DELETE` distinguishes DELETE from INSERT
+
+**Long-poll push flow:**
+CQN fires → `notifyUser(ausId)` (events.js) → resolves pending `/api/events/:aus_id` response → browser sees `type:'notification'` → refreshes bell → immediately polls again.
+
+**`waiters`** Map in `server.js`: `aus_id(string) → [{ res, timeout }]` — resolved on CQN event or 25s timeout. `req.on('close')` cleans up early if browser navigates away.
+
+**Graceful shutdown:** `server.js` handles `SIGTERM`/`SIGINT` — drains all pending long-poll waiters (sends `timeout` response), closes HTTP server, then closes DB pool. pm2 sends `SIGTERM` on restart.
+
+## APEX Ajax Callbacks
+
+### chatHeartbeat (Page 0 — every 20s from global.js)
+
+```sql
+BEGIN
+  OWA_UTIL.MIME_HEADER('application/json', TRUE, 'UTF-8');
+  IF :G_AUS_ID IS NULL THEN
+    HTP.p('{"status":"skip"}'); RETURN;
+  END IF;
+  MERGE INTO CHAT_USER_ONLINE o
+  USING (SELECT :G_AUS_ID AS aus_id FROM DUAL) src
+    ON  (o.aus_id = src.aus_id)
+  WHEN MATCHED     THEN UPDATE SET last_seen = SYSTIMESTAMP
+  WHEN NOT MATCHED THEN INSERT (aus_id, last_seen) VALUES (src.aus_id, SYSTIMESTAMP);
+  COMMIT;
+  HTP.p('{"status":"ok"}');
+END;
+```
+
+**Note:** `:G_AUS_ID` is reliable in these page-level callbacks (Page 0 session state is reliably sent). In Application Processes use `:APP_USER` instead — see `07-pitfalls.md`.
+
+## Browser Poll Loop (APEX Theme global.js)
+
+Paste into `Shared Components → Themes → Edit → JavaScript` (runs on every page).
+
+**Unified poll** — one ORDS thread per user (was two: notificationWait + chatEvents).  
+`apex:chatEvent` jQuery event is dispatched to any page-level listeners (Chat System, Doc Chat).
+
+```javascript
+(function () {
+    'use strict';
+    if (window._eventsPoll) return;
+    // Chỉ TOP window được poll. Page chạy trong iframe (vd Doc Chat modal page 10022710201)
+    // KHÔNG tự poll — nó đi nhờ poll của trang cha; trang cha dispatch apex:chatEvent trên
+    // parent.document (chính chỗ doc-chat-page.js lắng nghe). Nếu iframe cũng poll thì có 2 poll
+    // cùng aus_id giành 1 waiter (events.js: 1 waiter/user) → đá nhau (replaced) → rớt event,
+    // và event của iframe lại bắn vào document iframe nơi không có handler. Xem REVIEW-realtime-flow.
+    if (window.parent && window.parent !== window) return;
+
+    $(document).ready(function () {
+        var ausId = $v('P0_AUS_ID');
+        if (!ausId) return;
+
+        window._eventsPoll = true;
+        var _backoff = 5000;
+
+        function poll() {
+            apex.server.process('appEvents', {}, {
+                dataType: 'json',
+                success: function (data) {
+                    _backoff = 5000;
+                    if (!data) { poll(); return; }
+                    if (data.type === 'notification') {
+                        apex.region('notification-menu').refresh();
+                    } else if (data.type === 'message' || data.type === 'typing' ||
+                               data.type === 'typing_stop' || data.type === 'read') {
+                        // Chat System (page-app.jsx) and Doc Chat (doc-chat-app.jsx)
+                        // both listen for this event.
+                        $(document).trigger('apex:chatEvent', [data]);
+                    }
+                    poll();
+                },
+                error: function () {
+                    setTimeout(poll, _backoff);
+                    _backoff = Math.min(_backoff * 2, 60000);
+                }
+            });
+        }
+        poll();
+
+        apex.server.process('chatHeartbeat', {});
+        setInterval(function () { apex.server.process('chatHeartbeat', {}); }, 20000);
+    });
+})();
+```
+
+**`P0_AUS_ID`** is a Page 0 hidden item (has a DOM element, so `$v()` works). Do NOT use `$v('G_AUS_ID')` — always returns `""` because `G_AUS_ID` is an Application Item with no DOM element.
+
+### Ranh giới kênh `appEvents` (đọc trước khi thêm feature real-time)
+
+- **Kênh là lossy single-shot.** `events.js` chỉ giữ **1 waiter/aus_id**; mỗi resolve trả đúng 1
+  payload rồi xóa waiter. Feature nào *bắt buộc nhận đủ gói* (như chat message) **không được tin
+  vào việc tín hiệu luôn tới** — phải tự bù bằng re-fetch DB (handler hiện re-fetch qua `loadThread`)
+  và dựa vào **buffer at-least-once** ở `events.js` (xếp hàng `message`/`read`/`notification` khi
+  không có waiter; xem `deliverToUser`). Notification thì lossy-OK vì chuông tự query lại DB.
+- **Iframe KHÔNG tự poll.** Page mở trong iframe (Doc Chat modal) đi nhờ poll của trang cha — guard
+  `if (window.parent !== window) return;` trong `global.js`. Hai poll cùng aus_id sẽ đá nhau và rớt
+  event. Chi tiết: `docs/reviews/REVIEW-realtime-flow-2026-06-02.md`.
+- **Giới hạn:** đa tab cùng user vẫn chỉ có 1 poll thắng tại một thời điểm; buffer đảm bảo *không
+  mất* nhưng *không fan-out* mọi tab. Fan-out đúng cần nhiều waiter/user + cursor (đánh đổi ORDS
+  thread — xem `08-archive.md`).
+
+## APEX Callback: appEvents (replaces notificationWait)
+
+**Page 0 — Ajax Callback** named `appEvents`:
+
+```sql
+DECLARE
+    l_url    VARCHAR2(500);
+    l_req    UTL_HTTP.REQ;
+    l_resp   UTL_HTTP.RESP;
+    l_body   VARCHAR2(32767) := '';
+    l_buffer VARCHAR2(32767);
+BEGIN
+    OWA_UTIL.MIME_HEADER('application/json', TRUE, 'UTF-8');
+    IF :G_AUS_ID IS NULL THEN
+        HTP.p('{"type":"timeout"}');
+        RETURN;
+    END IF;
+    l_url := 'http://172.25.10.38:3410/api/events/' || :G_AUS_ID;
+    UTL_HTTP.SET_TRANSFER_TIMEOUT(28);
+    l_req  := UTL_HTTP.BEGIN_REQUEST(l_url, 'GET', 'HTTP/1.1');
+    UTL_HTTP.SET_HEADER(l_req, 'Connection', 'close');
+    l_resp := UTL_HTTP.GET_RESPONSE(l_req);
+    BEGIN
+        LOOP
+            UTL_HTTP.READ_TEXT(l_resp, l_buffer, 32767);
+            l_body := l_body || l_buffer;
+        END LOOP;
+    EXCEPTION
+        WHEN UTL_HTTP.END_OF_BODY THEN NULL;
+    END;
+    UTL_HTTP.END_RESPONSE(l_resp);
+    HTP.p(l_body);
+EXCEPTION
+    WHEN OTHERS THEN
+        BEGIN UTL_HTTP.END_RESPONSE(l_resp); EXCEPTION WHEN OTHERS THEN NULL; END;
+        HTP.p('{"type":"timeout"}');
+END;
+```
+
+**Migration checklist (APEX side):**
+1. Create `appEvents` Page 0 Ajax Callback (SQL above)
+2. Update Theme global.js (code above) — removes `notificationWait` poll, adds `appEvents` poll
+3. Delete old `notificationWait` Page 0 Ajax Callback
+4. Delete old `chatEvents` Application Process (now handled via `apex:chatEvent` event in page-app.jsx)
+5. Delete old `docChatEvents` Page 10022710201 Ajax Callback (now handled via `apex:chatEvent` event in doc-chat-app.jsx)
