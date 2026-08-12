@@ -14,7 +14,8 @@
     "password": "tncgic001",
     "connectString": "172.25.10.18:1521/pdbgc19c",
     "cqn": true,
-    "pwaDbKey": "apex_tnc"
+    "pwaDbKey": "apex_tnc",
+    "host": "chatdev.erp100.vn"
   },
   {
     "key": "apex_tnc",

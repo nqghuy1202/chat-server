@@ -1,13 +1,15 @@
 'use strict';
 const express  = require('express');
 const oracledb = require('oracledb');
-const { deliverToUser } = require('./events');
+const { deliverToUser, dbKeysForAusId } = require('./events');
 const registry = require('./db-registry');
 
-// Chat chạy single-schema trên pool primary → member là aus_id của schema primary,
-// nên SSE conn của họ đăng ký namespace `<primaryKey>:ausId`. deliverToConv phải deliver
-// đúng namespace đó (KHÔNG dùng DEFAULT_DB_KEY — đó là fallback token cũ, khái niệm khác).
-// TODO(multi-db): khi chat.js chọn pool theo dbKey của request, truyền dbKey thật vào đây.
+// Đường DELIVERY real-time là ĐA-DB: deliverToConv nhận dbKey (mặc định = primaryKey()
+// khi request không gửi db_key → dev/primary giữ nguyên hành vi cũ). getParticipants query
+// đúng pool của schema đó và cache tách theo khóa `<dbKey>:<convId>` (conv_id có thể trùng
+// giữa các schema). broadcast-message đọc db_key từ body (app APEX tnc gửi 'tnc').
+// TODO(multi-db): các route GHI DB (send/upload-send/create/read/typing) vẫn dùng withConn
+// (pool primary) — hiện mới đa-DB ở đường DELIVERY. tnc ghi DB qua APEX nên đủ dùng.
 
 const router = express.Router();
 
@@ -20,9 +22,13 @@ const typingState      = new Map();   // `${conv_id}:${aus_id}` → expireHandle
 const participantCache = new Map();   // conv_id(number) → { ausIds: number[], expiresAt: number }
 let   onlineCache      = null;        // { ausIds: number[], expiresAt: number } | null
 
+// `<conv_id>:<aus_id>` → { dbKey, expiresAt } — kết quả probe schema (xem resolveDbKey)
+const convDbKeyCache = new Map();
+
 const TYPING_TTL            =  4_000;   // 4s  — tự xóa typing nếu không có heartbeat
 const PARTICIPANT_CACHE_TTL = 60_000;   // 60s — cache participant list mỗi conv
 const ONLINE_CACHE_TTL      = 30_000;   // 30s — cache online list, tránh Oracle query mỗi request
+const CONV_DBKEY_TTL        = 300_000;  // 5m  — 1 conv không đổi schema, cache dài được
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 
@@ -42,12 +48,25 @@ const normalize = rows =>
     Object.entries(row).map(([k, v]) => [k.toLowerCase(), v])
   ));
 
-// Participant list với 60s cache — tránh query DB mỗi lần typing/read event
-async function getParticipants(convId) {
-  const cached = participantCache.get(convId);
+// withConn bản chọn pool theo dbKey — dùng cho đường delivery đa-DB.
+// (withConn ở trên giữ nguyên chữ ký cũ cho các route GHI DB, luôn pool primary.)
+async function withConnKey(dbKey, fn) {
+  const conn = await registry.getPool(dbKey).getConnection();
+  try {
+    return await fn(conn);
+  } finally {
+    await conn.close();
+  }
+}
+
+// Participant list với 60s cache — tránh query DB mỗi lần typing/read event.
+// Cache tách theo `<dbKey>:<convId>` vì conv_id có thể trùng giữa các schema.
+async function getParticipants(dbKey, convId) {
+  const cacheKey = dbKey + ':' + convId;
+  const cached = participantCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) return cached.ausIds;
 
-  const rows = await withConn(async conn => {
+  const rows = await withConnKey(dbKey, async conn => {
     const r = await conn.execute(
       `SELECT aus_id FROM CHAT_PARTICIPANTS WHERE conv_id = :conv_id`,
       { conv_id: convId },
@@ -56,20 +75,77 @@ async function getParticipants(convId) {
     return r.rows;
   });
   const ausIds = rows.map(r => r.AUS_ID);
-  participantCache.set(convId, { ausIds, expiresAt: Date.now() + PARTICIPANT_CACHE_TTL });
+  participantCache.set(cacheKey, { ausIds, expiresAt: Date.now() + PARTICIPANT_CACHE_TTL });
   return ausIds;
 }
 
+// Chốt schema của 1 hội thoại bằng cách HỎI DB, không đoán.
+//
+// Vì sao cần: broadcast-message không mang db_key, host thì dùng chung giữa dev/tnc,
+// còn "suy từ SSE của người gửi" sai ngay khi cùng aus_id mở app ở 2 schema cùng lúc
+// (vd 260504 có cả conn dev24:260504 lẫn tnc:260504 → bốc nhầm dev24 → members=[]).
+// Bằng chứng duy nhất không mơ hồ: cặp (conv_id, aus_id) chỉ tồn tại trong CHAT_PARTICIPANTS
+// của ĐÚNG schema chứa hội thoại đó.
+//
+// candidates: thứ tự probe (SSE keys của người gửi → host → primary). Trả null nếu
+// không schema nào khớp — caller tự quyết fallback.
+async function resolveDbKey(convId, ausId, candidates) {
+  const cacheKey = convId + ':' + ausId;
+  const cached = convDbKeyCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.dbKey;
+
+  // Probe HẾT ứng viên (không dừng ở cái khớp đầu) để phát hiện trường hợp mập mờ:
+  // conv_id có thể trùng số giữa 2 schema và người gửi là thành viên ở cả hai.
+  // Khi đó vẫn lấy ứng viên đầu nhưng WARN — dấu hiệu APEX cần gửi db_key tường minh.
+  const matches = [];
+  for (const dbKey of candidates) {
+    if (!registry.isReady(dbKey)) continue;
+    try {
+      const found = await withConnKey(dbKey, async conn => {
+        const r = await conn.execute(
+          `SELECT 1 AS hit FROM CHAT_PARTICIPANTS
+            WHERE conv_id = :conv_id AND aus_id = :aus_id AND ROWNUM = 1`,
+          { conv_id: Number(convId), aus_id: Number(ausId) },
+          { outFormat: oracledb.OUT_FORMAT_OBJECT }
+        );
+        return r.rows.length > 0;
+      });
+      if (found) matches.push(dbKey);
+    } catch (err) {
+      // Pool hỏng / bảng thiếu ở schema đó → bỏ qua, thử ứng viên tiếp theo
+      console.error('[Chat] resolveDbKey probe %s failed: %s', dbKey, err.message);
+    }
+  }
+
+  console.log('[Chat] resolveDbKey conv=%s aus=%s candidates=[%s] → matches=[%s]',
+    convId, ausId, candidates.join(','), matches.join(','));
+  if (matches.length > 1) {
+    console.warn('[Chat] resolveDbKey MẬP MỜ conv=%s aus=%s khớp %d schema → chọn %s. ' +
+      'APEX nên gửi db_key tường minh trong body broadcast-message.',
+      convId, ausId, matches.length, matches[0]);
+  }
+  if (!matches.length) return null;
+
+  convDbKeyCache.set(cacheKey, { dbKey: matches[0], expiresAt: Date.now() + CONV_DBKEY_TTL });
+  return matches[0];
+}
+
 // Đẩy event tới tất cả thành viên của conv, trừ excludeAusId.
+// excludeAusId = null/undefined → gửi cho TẤT CẢ member, kể cả người gửi
+// (broadcast-message cần echo: xem giải thích ở route đó).
+// dbKey (mặc định = primaryKey()) chọn ĐÚNG pool query participants + ĐÚNG namespace SSE
+// `<dbKey>:<ausId>`. Route cũ gọi thiếu dbKey → primary → hành vi dev/primary không đổi.
 // Ép kiểu số một chỗ: participant aus_id là NUMBER từ Oracle, còn excludeAusId
 // có thể tới dạng string từ req.body (APEX gửi JSON). So sánh number-vs-string
 // luôn !== → người gửi tự nhận lại tin của mình (self-echo). Number() chặn việc này.
-async function deliverToConv(convId, payload, excludeAusId) {
-  const ausIds = await getParticipants(convId);
-  const exclude = Number(excludeAusId);
-  for (const ausId of ausIds) {
-    if (Number(ausId) !== exclude) deliverToUser(registry.primaryKey(), ausId, payload);
-  }
+async function deliverToConv(convId, payload, excludeAusId, dbKey = registry.primaryKey()) {
+  const ausIds = await getParticipants(dbKey, convId);
+  const exclude = (excludeAusId === null || excludeAusId === undefined)
+    ? null : Number(excludeAusId);
+  const targets = exclude === null ? ausIds : ausIds.filter(a => Number(a) !== exclude);
+  console.log('[Chat] deliverToConv db=%s conv=%s type=%s members=[%s] exclude=%s → target=[%s]',
+    dbKey, convId, payload.type, ausIds.join(','), exclude, targets.join(','));
+  for (const ausId of targets) deliverToUser(dbKey, ausId, payload);
 }
 
 // ─── GET /api/chat/conversations/:aus_id ─────────────────────────────────────
@@ -676,16 +752,32 @@ router.post('/attach', (req, res) => {
 //         reply_to_msg_id, doc_type, doc_no, conv_type, conv_name, from_name? }
 router.post('/broadcast-message', (req, res) => {
   const { conv_id, msg_id, aus_id, body, fil_id, file_name, file_disp_name,
-          reply_to_msg_id, doc_type, doc_no, conv_type, conv_name, from_name } = req.body;
+          reply_to_msg_id, doc_type, doc_no, conv_type, conv_name, from_name, db_key } = req.body;
 
   if (!conv_id || !msg_id || !aus_id) {
     return res.status(400).json({ error: 'conv_id, msg_id và aus_id là bắt buộc' });
   }
 
+  // Multi-DB: app APEX gửi db_key='tnc' → tin tuyệt đối, dùng luôn, khỏi probe.
+  // Không có db_key → PROBE DB (resolveDbKey) thay vì đoán: hỏi schema nào thực sự
+  // chứa cặp (conv_id, aus_id). Thứ tự ứng viên = mọi SSE key của người gửi → host
+  // → primary; dedupe. Đoán bằng SSE key đơn lẻ đã từng sai khi user mở cả 2 môi trường.
+  const senderKeys = dbKeysForAusId(aus_id);
+  const hostKey    = registry.dbKeyByHost(req.headers.host);
+  const candidates = [...new Set([...senderKeys, hostKey, registry.primaryKey()].filter(Boolean))];
+
   // Cùng shape event với /send để onChatEvent xử lý đồng nhất. Client nhận
   // 'message' sẽ refreshThread() qua APEX (đã JOIN FILES) nên các field nội
   // dung chỉ mang tính enrich/cross-doc, không phải nguồn render chính.
-  deliverToConv(conv_id, {
+  //
+  // KHÔNG exclude người gửi ở luồng này (khác /send). Ở /send Node tự INSERT rồi
+  // trả msg trong response nên client người gửi có nguồn render riêng → exclude để
+  // tránh self-echo. Còn broadcast-message thì APEX ghi DB, client người gửi KHÔNG
+  // có nguồn render nào khác: bị exclude là không nhận event → không refreshThread()
+  // → tin mình vừa gửi không hiện trên màn hình (chỉ sidebar cập nhật qua unread-summary).
+  // Echo lại cho người gửi an toàn vì event chỉ là trigger refetch — refreshThread()
+  // nạp lại cả thread từ APEX nên idempotent, không đẻ tin trùng.
+  const broadcast = dbKey => deliverToConv(conv_id, {
     type:      'message',
     conv_id,
     doc_type:  doc_type  || null,
@@ -704,8 +796,19 @@ router.post('/broadcast-message', (req, res) => {
       file_name:       file_name || null,
       file_disp_name:  file_disp_name || null,
     },
-  }, aus_id)
-    .catch(err => console.error('[Chat] deliverToConv (broadcast-message):', err.message));
+  }, null, dbKey);
+
+  // db_key client gửi = tin tuyệt đối; không có thì probe. Fallback cuối là primary
+  // (giữ hành vi cũ cho client single-DB). Response trả ngay, không chờ delivery.
+  (db_key
+    ? Promise.resolve(db_key)
+    : resolveDbKey(conv_id, aus_id, candidates).then(k => k || registry.primaryKey())
+  ).then(dbKey => {
+    console.log('[Chat] broadcast-message conv=%s msg=%s from=%s db_key(raw)=%s senderKeys=[%s] hostKey=%s host=%s → dbKey=%s',
+      conv_id, msg_id, aus_id, JSON.stringify(db_key), senderKeys.join(','),
+      hostKey, req.headers.host, dbKey);
+    return broadcast(dbKey);
+  }).catch(err => console.error('[Chat] broadcast-message:', err.message));
 
   res.json({ status: 'ok' });
 });
@@ -946,7 +1049,8 @@ router.post('/create', async (req, res) => {
       return cid;
     });
 
-    participantCache.delete(convId);
+    // Cache participants dùng khóa `<dbKey>:<convId>`; /create chạy trên pool primary.
+    participantCache.delete(registry.primaryKey() + ':' + convId);
     res.json({ status: 'ok', conv_id: convId });
   } catch (err) {
     console.error('[Chat] POST /create:', err.message);

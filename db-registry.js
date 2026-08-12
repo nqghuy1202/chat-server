@@ -55,6 +55,9 @@ function loadRegistry() {
             connectString: d.connectString,
             cqn:           d.cqn === true,
             primary:       d.primary === true,
+            // host: domain công khai mà request tới node mang trong header Host — dùng để
+            // map request → dbKey khi client KHÔNG gửi db_key (vd broadcast-message). Bỏ port.
+            host:          d.host ? String(d.host).toLowerCase().split(':')[0] : null,
             // pwaDbKey: khi gửi PWA cho notif của DB này, gọi package trên pool KHÁC
             // (vd package pkg_push_notification_pwa nằm ở apex_tnc, DBLINK sang tnc).
             pwaDbKey:      d.pwaDbKey ? String(d.pwaDbKey) : null,
@@ -106,6 +109,13 @@ async function initPools() {
 function primaryKey()        { return _primaryKey; }
 function listDbs()           { return _dbs.slice(); }
 function getDb(key)          { return _dbs.find(d => d.key === (key || _primaryKey)) || null; }
+// Map header Host của request → dbKey (bỏ port, không phân biệt hoa/thường). null nếu không khớp.
+function dbKeyByHost(host) {
+    if (!host) return null;
+    const h = String(host).toLowerCase().split(':')[0];
+    const found = _dbs.find(d => d.host && d.host === h);
+    return found ? found.key : null;
+}
 function isReady(key)        { return _ready.has(key || _primaryKey); }
 // Chỉ CQN trên DB cqn:true CÓ pool sẵn sàng (pool hỏng → không subscribe).
 function cqnDbs()            { return _dbs.filter(d => d.cqn && _ready.has(d.key)); }
@@ -123,6 +133,6 @@ async function closeAll(drainSeconds = 10) {
 
 module.exports = {
     loadRegistry, initPools,
-    primaryKey, listDbs, getDb, cqnDbs, isReady,
+    primaryKey, listDbs, getDb, cqnDbs, isReady, dbKeyByHost,
     getConnection, getPool, closeAll,
 };

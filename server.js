@@ -36,6 +36,14 @@ app.use((req, res, next) => {
     next();
 });
 
+// [DEBUG tạm] Log MỌI request tới node — để xác định request /api/chat/* có thực sự
+// đến node qua nginx không, hay bị lạc sang domain khác (nhận HTML <!DOCTYPE>).
+app.use((req, res, next) => {
+    console.log('[HTTP] %s %s host=%s origin=%s', req.method, req.originalUrl,
+        req.headers.host, req.headers.origin);
+    next();
+});
+
 // Pool khởi tạo động từ db-registry.json (mọi DB, poolAlias=key, events:true).
 // Xem db-registry.js. CQN hiện chạy trên primary DB; worker-split (Phương án C)
 // là bước sau, sẽ dùng registry.cqnDbs().
@@ -48,6 +56,9 @@ async function initDB() {
 // ──────────────────────────────────────────────
 
 app.use('/api/chat', chatRouter);
+// [COMPAT tạm] chat-modal đang ghép base thừa '/chat' → gọi /api/chat/chat/... → 404.
+// Alias để không vỡ trong lúc chưa sửa base ở client. GỠ sau khi sửa chat-modal.
+app.use('/api/chat/chat', chatRouter);
 
 app.get('/health', (req, res) => {
     res.json({ status: 'OK', time: new Date().toISOString() });

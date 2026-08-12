@@ -56,15 +56,21 @@ function registerSSE(dbKey, ausId, res, lastEventId) {
     // Đẩy conn cũ ra
     const old = sseConnections.get(key);
     if (old) {
+        console.log('[SSE] %s: conn cũ bị THAY THẾ bởi conn mới (tab reload / tab thứ 2?)', key);
         try { old.write('event: replaced\ndata: {}\n\n'); old.end(); } catch (_) {}
     }
     sseConnections.set(key, res);
 
-    // Flush buffer từ lastEventId trở đi (replay sau reconnect)
+    // Flush buffer từ lastEventId trở đi (replay sau reconnect).
+    // Log số event replay: lastEventId=0 kèm replay>0 nghĩa là client mất seq
+    // (worker mới tinh — page reload), chứ không phải nó đã nhận rồi bỏ qua.
     const since = Number(lastEventId) || 0;
     const q = pruneBuffer(key);
     if (q) {
-        q.filter(e => e.seq > since).forEach(e => sseWrite(res, e.seq, e.payload));
+        const pending = q.filter(e => e.seq > since);
+        console.log('[SSE] %s: replay lastEventId=%s → %d/%d event trong buffer',
+            key, since, pending.length, q.length);
+        pending.forEach(e => sseWrite(res, e.seq, e.payload));
     }
 
     res.on('close', () => {
@@ -75,6 +81,10 @@ function registerSSE(dbKey, ausId, res, lastEventId) {
 function deliverToUser(dbKey, ausId, payload) {
     const key    = keyOf(dbKey, ausId);
     const sseRes = sseConnections.get(key);
+
+    console.log('[Events] deliver key=%s type=%s → %s | conns=[%s]',
+        key, payload.type, sseRes ? 'SSE-OPEN' : 'BUFFERED',
+        [...sseConnections.keys()].join(', '));
 
     if (sseRes) {
         const seq = ++sseSeq;
@@ -100,6 +110,19 @@ function notifyUser(ausId, dbKey = DEFAULT_DB_KEY) {
     console.log('[Events] notification → %s:%s', dbKey, ausId);
 }
 
+// MỌI dbKey mà aus_id này đang có SSE conn (key = "<dbKey>:<ausId>").
+// Trả về MẢNG chứ không phải 1 giá trị: cùng 1 aus_id có thể mở app ở nhiều schema
+// cùng lúc (vd 260504 vừa mở dev24 vừa mở tnc) — chọn bừa cái đầu tiên là đoán sai.
+// Caller dùng danh sách này làm ỨNG VIÊN rồi probe DB để chốt schema đúng.
+function dbKeysForAusId(ausId) {
+    const suffix = ':' + String(ausId);
+    const keys = [];
+    for (const key of sseConnections.keys()) {
+        if (key.endsWith(suffix)) keys.push(key.slice(0, -suffix.length));
+    }
+    return keys;
+}
+
 function drainAll() {
     for (const [, res] of sseConnections) {
         try { res.write('event: close\ndata: {}\n\n'); res.end(); } catch (_) {}
@@ -107,4 +130,4 @@ function drainAll() {
     sseConnections.clear();
 }
 
-module.exports = { deliverToUser, notifyUser, drainAll, registerSSE };
+module.exports = { deliverToUser, notifyUser, drainAll, registerSSE, dbKeysForAusId };
