@@ -1,33 +1,18 @@
 [
   {
-    "key": "dev24",
+    "key": "keyname",
     "primary": true,
-    "user": "DEV24",
-    "password": "dev24gic001",
-    "connectString": "172.25.10.18:1521/pdbgc19c",
+    "user": "dbuser",
+    "password": "dbpwd",
+    "connectString": "ip/domain",
     "cqn": true,
-    "pwaDbKey": "apex_dev"
+    "pwaDbKey": "dbapex_dblink"
   },
   {
-    "key": "tnc",
-    "user": "TNC",
-    "password": "tncgic001",
-    "connectString": "172.25.10.18:1521/pdbgc19c",
-    "cqn": true,
-    "pwaDbKey": "apex_tnc",
-    "host": "chatdev.erp100.vn"
-  },
-  {
-    "key": "apex_tnc",
-    "user": "APEX_TNC",
-    "password": "tncgic001",
-    "connectString": "172.25.10.50:1521/pdbapex19c.localdomain"
-  },
-  {
-    "key": "apex_dev",
-    "user": "APEX_DEV",
-    "password": "Dev12345",
-    "connectString": "172.25.10.50:1521/pdbapex19c.localdomain"
+    "key": "dbapex_key",
+    "user": "dbuser_apex",
+    "password": "dbapex_pwd",
+    "connectString": "ip/domain"
   }
 
 ]
